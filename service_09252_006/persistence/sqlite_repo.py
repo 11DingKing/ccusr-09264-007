@@ -18,16 +18,20 @@ from ..domain.fingerprint import digest_bytes
 from ..domain.models import (
     AuditEntry,
     Blob,
+    EscalationEvent,
     Material,
     MaterialVersion,
+    Notification,
     Objection,
     PackageEntry,
     ReviewPackage,
     ReviewRequest,
+    SlaCase,
+    SlaPause,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -176,7 +180,53 @@ class SqliteRepository(Repository):
                     created_at  TEXT NOT NULL
                 );
 
-                PRAGMA user_version = 1;
+                CREATE TABLE IF NOT EXISTS sla_cases (
+                    case_id        TEXT PRIMARY KEY,
+                    request_id     TEXT NOT NULL REFERENCES requests(request_id),
+                    package_id     TEXT NOT NULL,
+                    institution_id TEXT NOT NULL,
+                    priority       TEXT NOT NULL,
+                    owner_id       TEXT NOT NULL,
+                    opened_at      TEXT NOT NULL,
+                    closed_at      TEXT,
+                    escalated_at   TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_sla_cases_request
+                    ON sla_cases(request_id, closed_at);
+
+                CREATE TABLE IF NOT EXISTS sla_pauses (
+                    pause_id   TEXT PRIMARY KEY,
+                    case_id    TEXT NOT NULL REFERENCES sla_cases(case_id),
+                    reason     TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL,
+                    ended_at   TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_sla_pauses_case
+                    ON sla_pauses(case_id, ended_at);
+
+                CREATE TABLE IF NOT EXISTS sla_escalations (
+                    escalation_id             TEXT PRIMARY KEY,
+                    case_id                   TEXT NOT NULL REFERENCES sla_cases(case_id),
+                    request_id                TEXT NOT NULL,
+                    owner_id                  TEXT NOT NULL,
+                    elapsed_business_seconds  INTEGER NOT NULL,
+                    limit_business_seconds    INTEGER NOT NULL,
+                    created_at                TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_sla_escalations_case
+                    ON sla_escalations(case_id);
+
+                CREATE TABLE IF NOT EXISTS notifications (
+                    notification_id TEXT PRIMARY KEY,
+                    user_id         TEXT NOT NULL,
+                    kind            TEXT NOT NULL,
+                    message         TEXT NOT NULL,
+                    created_at      TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_notifications_user
+                    ON notifications(user_id, created_at);
+
+                PRAGMA user_version = 2;
             """
         )
 
@@ -663,6 +713,191 @@ class SqliteRepository(Repository):
                 action=r["action"],
                 at=r["at"],
                 detail=json.loads(r["detail_json"]),
+            )
+            for r in rows
+        ]
+
+    # -------------------------------------------------------- SLA 时限案件
+    def insert_sla_case(self, case: SlaCase) -> None:
+        self._conn.execute(
+            "INSERT INTO sla_cases(case_id, request_id, package_id, institution_id,"
+            " priority, owner_id, opened_at, closed_at, escalated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                case.case_id,
+                case.request_id,
+                case.package_id,
+                case.institution_id,
+                case.priority,
+                case.owner_id,
+                case.opened_at,
+                case.closed_at,
+                case.escalated_at,
+            ),
+        )
+
+    @staticmethod
+    def _row_to_sla_case(row: sqlite3.Row) -> SlaCase:
+        return SlaCase(
+            case_id=row["case_id"],
+            request_id=row["request_id"],
+            package_id=row["package_id"],
+            institution_id=row["institution_id"],
+            priority=row["priority"],
+            owner_id=row["owner_id"],
+            opened_at=row["opened_at"],
+            closed_at=row["closed_at"],
+            escalated_at=row["escalated_at"],
+        )
+
+    def get_sla_case(self, case_id: str) -> SlaCase | None:
+        row = self._conn.execute(
+            "SELECT * FROM sla_cases WHERE case_id = ?", (case_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_sla_case(row)
+
+    def get_open_sla_case_by_request(self, request_id: str) -> SlaCase | None:
+        row = self._conn.execute(
+            "SELECT * FROM sla_cases WHERE request_id = ? AND closed_at IS NULL"
+            " ORDER BY opened_at LIMIT 1",
+            (request_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_sla_case(row)
+
+    def list_open_sla_cases(self) -> list[SlaCase]:
+        rows = self._conn.execute(
+            "SELECT * FROM sla_cases WHERE closed_at IS NULL ORDER BY opened_at"
+        ).fetchall()
+        return [self._row_to_sla_case(r) for r in rows]
+
+    def update_sla_case_owner(self, case_id: str, owner_id: str) -> None:
+        self._conn.execute(
+            "UPDATE sla_cases SET owner_id = ? WHERE case_id = ?",
+            (owner_id, case_id),
+        )
+
+    def close_sla_case(self, case_id: str, closed_at: str) -> bool:
+        cur = self._conn.execute(
+            "UPDATE sla_cases SET closed_at = ?"
+            " WHERE case_id = ? AND closed_at IS NULL",
+            (closed_at, case_id),
+        )
+        return cur.rowcount == 1
+
+    def mark_sla_case_escalated(self, case_id: str, at: str) -> bool:
+        cur = self._conn.execute(
+            "UPDATE sla_cases SET escalated_at = ?"
+            " WHERE case_id = ? AND escalated_at IS NULL",
+            (at, case_id),
+        )
+        return cur.rowcount == 1
+
+    # -------------------------------------------------------- SLA 暂停区间
+    def insert_sla_pause(self, pause: SlaPause) -> None:
+        self._conn.execute(
+            "INSERT INTO sla_pauses(pause_id, case_id, reason, started_at, ended_at)"
+            " VALUES(?,?,?,?,?)",
+            (pause.pause_id, pause.case_id, pause.reason, pause.started_at, pause.ended_at),
+        )
+
+    @staticmethod
+    def _row_to_sla_pause(row: sqlite3.Row) -> SlaPause:
+        return SlaPause(
+            pause_id=row["pause_id"],
+            case_id=row["case_id"],
+            reason=row["reason"],
+            started_at=row["started_at"],
+            ended_at=row["ended_at"],
+        )
+
+    def get_open_sla_pause(self, case_id: str) -> SlaPause | None:
+        row = self._conn.execute(
+            "SELECT * FROM sla_pauses WHERE case_id = ? AND ended_at IS NULL"
+            " ORDER BY started_at LIMIT 1",
+            (case_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_sla_pause(row)
+
+    def list_sla_pauses(self, case_id: str) -> list[SlaPause]:
+        rows = self._conn.execute(
+            "SELECT * FROM sla_pauses WHERE case_id = ? ORDER BY started_at",
+            (case_id,),
+        ).fetchall()
+        return [self._row_to_sla_pause(r) for r in rows]
+
+    def close_sla_pause(self, pause_id: str, ended_at: str) -> bool:
+        cur = self._conn.execute(
+            "UPDATE sla_pauses SET ended_at = ?"
+            " WHERE pause_id = ? AND ended_at IS NULL",
+            (ended_at, pause_id),
+        )
+        return cur.rowcount == 1
+
+    # -------------------------------------------------------- 升级与通知
+    def insert_escalation(self, event: EscalationEvent) -> None:
+        self._conn.execute(
+            "INSERT INTO sla_escalations(escalation_id, case_id, request_id, owner_id,"
+            " elapsed_business_seconds, limit_business_seconds, created_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (
+                event.escalation_id,
+                event.case_id,
+                event.request_id,
+                event.owner_id,
+                event.elapsed_business_seconds,
+                event.limit_business_seconds,
+                event.created_at,
+            ),
+        )
+
+    def list_escalations(self, case_id: str | None = None) -> list[EscalationEvent]:
+        if case_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM sla_escalations ORDER BY created_at"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM sla_escalations WHERE case_id = ? ORDER BY created_at",
+                (case_id,),
+            ).fetchall()
+        return [
+            EscalationEvent(
+                escalation_id=r["escalation_id"],
+                case_id=r["case_id"],
+                request_id=r["request_id"],
+                owner_id=r["owner_id"],
+                elapsed_business_seconds=r["elapsed_business_seconds"],
+                limit_business_seconds=r["limit_business_seconds"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def insert_notification(self, notification: Notification) -> None:
+        self._conn.execute(
+            "INSERT INTO notifications(notification_id, user_id, kind, message, created_at)"
+            " VALUES(?,?,?,?,?)",
+            (
+                notification.notification_id,
+                notification.user_id,
+                notification.kind,
+                notification.message,
+                notification.created_at,
+            ),
+        )
+
+    def list_notifications(self, user_id: str) -> list[Notification]:
+        rows = self._conn.execute(
+            "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at",
+            (user_id,),
+        ).fetchall()
+        return [
+            Notification(
+                notification_id=r["notification_id"],
+                user_id=r["user_id"],
+                kind=r["kind"],
+                message=r["message"],
+                created_at=r["created_at"],
             )
             for r in rows
         ]

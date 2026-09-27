@@ -29,6 +29,11 @@ def main(argv: list[str] | None = None) -> int:
     serve_p.add_argument("--host", default="127.0.0.1")
     serve_p.add_argument("--port", type=int, default=8080)
     serve_p.add_argument("--bootstrap-token", default="")
+    serve_p.add_argument(
+        "--calendar",
+        default=None,
+        help="案件日历 JSON（工作窗口/节假日/优先级时限）；缺省用内置日历",
+    )
 
     verify_p = sub.add_parser("verify", help="离线完整性核验")
     verify_p.add_argument("--db", required=True)
@@ -44,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _serve(args: argparse.Namespace) -> int:
-    with ApplicationContext(args.db) as context:
+    with ApplicationContext(args.db, calendar_path=args.calendar) as context:
         server = HttpApiServer(
             context,
             host=args.host,

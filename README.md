@@ -46,6 +46,19 @@
 - 截止时间以“当地时间 + IANA 时区”输入，统一换算为 UTC 绝对时刻，正确
   处理跨时区与日界线。
 
+### 评审服务时限（SLA）
+- 每个进行中的评审请求可立案一个时限案件，按**案件优先级**（P1–P4）在
+  **案件日历**上计时：只累计工作窗口内的时间，夜间/周末/节假日不计。
+- 案件日历由 Python 从 JSON 文件读取（`serve --calendar`，缺省为周一至
+  周五 09:00–18:00 Asia/Shanghai）：工作窗口、节假日、各级时限均可配置。
+- **转交期间暂停计时**：`transfer` 打开暂停区间、`transfer/complete` 关闭
+  区间并切换负责人；暂停区间写入 SQLite，累计与推算截止时刻都扣除——
+  转交不消耗时限。
+- 超时由 `POST /v1/sla/sweep` 扫描生成**升级事件**并**通知当前负责人**
+  （转交后的新负责人）；升级标记用条件 UPDATE 抢占，重复扫描不重复升级。
+- `GET /v1/sla/cases/{id}` 为只读重算视图：已用/剩余工作秒、推算截止
+  时刻（暂停中挂起）、是否超时。
+
 ## 分层结构
 
 ```
@@ -67,7 +80,21 @@ service_09252_006/
 # 数据库文件放在源码目录之外
 python3 -m service_09252_006.cli serve \
   --db ./data/qe.db --host 127.0.0.1 --port 8080 \
-  --bootstrap-token "$BOOTSTRAP_TOKEN"
+  --bootstrap-token "$BOOTSTRAP_TOKEN" \
+  [--calendar ./case_calendar.json]
+```
+
+案件日历 JSON 示例：
+
+```json
+{
+  "timezone": "Asia/Shanghai",
+  "work_windows": {"mon": [["09:00", "18:00"]], "tue": [["09:00", "18:00"]],
+                   "wed": [["09:00", "18:00"]], "thu": [["09:00", "18:00"]],
+                   "fri": [["09:00", "18:00"]]},
+  "holidays": ["2026-10-01"],
+  "priority_limits_hours": {"P1": 4, "P2": 8, "P3": 24, "P4": 72}
+}
 ```
 
 ## 离线完整性核验
@@ -106,6 +133,14 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/requests/{id}/verdict` | 提交 approve/object（object 须先有异议） |
 | POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权） |
 | POST | `/v1/packages/{id}/decision` | 签发 approved/needs_revision/rejected |
+| POST | `/v1/requests/{id}/sla` | 时限立案（priority，可指定 owner_id） |
+| GET  | `/v1/sla/cases/{id}` | 重算时限（已用/剩余工作秒、推算截止） |
+| POST | `/v1/sla/cases/{id}/transfer` | 开始转交（暂停计时） |
+| POST | `/v1/sla/cases/{id}/transfer/complete` | 完成转交（恢复计时、换负责人） |
+| POST | `/v1/sla/cases/{id}/close` | 结案（停止计时） |
+| POST | `/v1/sla/sweep` | 扫描超时案件：生成升级事件并通知负责人 |
+| GET  | `/v1/sla/cases/{id}/escalations` | 升级事件列表 |
+| GET  | `/v1/notifications` | 当前用户的通知 |
 
 评审状态机：`draft → sealed → under_review → decided`；复审包重新走一遍，
 旧包不复活。
@@ -122,5 +157,9 @@ python3 -m compileall -q service_09252_006 tests
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
 多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
 端到端流程。
+
+**评审服务时限**：**转交期间计时不累加**（含跨周末暂停）、截止时刻随暂停
+顺延、案件日历夜间/周末/节假日剔除与 JSON 读取、按优先级计时、超时升级
+并通知当前负责人、重复扫描幂等、结案/越权守卫与 SLA 的 HTTP 端到端。
 
 扩展模块覆盖证据、审批、权限、留存、对账与恢复等业务边界。

@@ -49,3 +49,12 @@ class Decision(str, Enum):
     APPROVED = "approved"
     NEEDS_REVISION = "needs_revision"
     REJECTED = "rejected"
+
+
+class SlaPriority(str, Enum):
+    """评审服务时限优先级；时限长度由案件日历配置（工作秒）。"""
+
+    P1 = "P1"
+    P2 = "P2"
+    P3 = "P3"
+    P4 = "P4"

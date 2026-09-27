@@ -12,12 +12,16 @@ from contextlib import AbstractContextManager
 from ..domain.models import (
     AuditEntry,
     Blob,
+    EscalationEvent,
     Material,
     MaterialVersion,
+    Notification,
     Objection,
     PackageEntry,
     ReviewPackage,
     ReviewRequest,
+    SlaCase,
+    SlaPause,
     User,
 )
 
@@ -148,3 +152,51 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 评审服务时限（SLA） ----
+    @abc.abstractmethod
+    def insert_sla_case(self, case: SlaCase) -> None: ...
+
+    @abc.abstractmethod
+    def get_sla_case(self, case_id: str) -> SlaCase | None: ...
+
+    @abc.abstractmethod
+    def get_open_sla_case_by_request(self, request_id: str) -> SlaCase | None: ...
+
+    @abc.abstractmethod
+    def list_open_sla_cases(self) -> list[SlaCase]: ...
+
+    @abc.abstractmethod
+    def update_sla_case_owner(self, case_id: str, owner_id: str) -> None: ...
+
+    @abc.abstractmethod
+    def close_sla_case(self, case_id: str, closed_at: str) -> bool:
+        """条件更新：仅未关闭时生效。"""
+
+    @abc.abstractmethod
+    def mark_sla_case_escalated(self, case_id: str, at: str) -> bool:
+        """条件更新：仅未升级时生效（并发扫描只有一方成功）。"""
+
+    @abc.abstractmethod
+    def insert_sla_pause(self, pause: SlaPause) -> None: ...
+
+    @abc.abstractmethod
+    def get_open_sla_pause(self, case_id: str) -> SlaPause | None: ...
+
+    @abc.abstractmethod
+    def list_sla_pauses(self, case_id: str) -> list[SlaPause]: ...
+
+    @abc.abstractmethod
+    def close_sla_pause(self, pause_id: str, ended_at: str) -> bool: ...
+
+    @abc.abstractmethod
+    def insert_escalation(self, event: EscalationEvent) -> None: ...
+
+    @abc.abstractmethod
+    def list_escalations(self, case_id: str | None = None) -> list[EscalationEvent]: ...
+
+    @abc.abstractmethod
+    def insert_notification(self, notification: Notification) -> None: ...
+
+    @abc.abstractmethod
+    def list_notifications(self, user_id: str) -> list[Notification]: ...

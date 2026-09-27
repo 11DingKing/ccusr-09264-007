@@ -197,6 +197,81 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
 
+    def test_sla_over_http(self) -> None:
+        """SLA 端点：立案 -> 转交暂停 -> 恢复 -> 超时升级 -> 通知当前负责人。"""
+        admin = self._create_user(
+            "admin-a", ["institution_admin"], "inst-a", "tok-admin"
+        )
+        authority = self._create_user(
+            "auth", ["quality_authority"], None, "tok-auth"
+        )
+        reviewer = self._create_user("rev-1", ["reviewer"], "inst-ext", "tok-rev")
+        reviewer2 = self._create_user("rev-2", ["reviewer"], "inst-ext2", "tok-rev2")
+        self.assertIsNotNone(admin.token)
+
+        # 用服务层准备已封存包与分配（HTTP 链路只覆盖 SLA 部分）
+        from tests.flow import seal_new_package
+
+        sealed = seal_new_package(self.h, self.h.repo.get_user("admin-a"))
+        req = self.h.ctx.reviews.assign_reviewer(
+            self.h.repo.get_user("auth"),
+            package_id=sealed.package_id,
+            reviewer_id="rev-1",
+        )
+        rid = req["request_id"]
+
+        # 未认证被拒
+        status, _ = ApiClient(self.base).request(
+            "POST", f"/v1/requests/{rid}/sla", {"priority": "P1"}
+        )
+        self.assertEqual(status, 403)
+
+        status, case = authority.request(
+            "POST", f"/v1/requests/{rid}/sla", {"priority": "P1"}
+        )
+        self.assertEqual(status, 201, case)
+        cid = case["case_id"]
+        self.assertEqual(case["owner_id"], "rev-1")
+
+        status, view = authority.request("GET", f"/v1/sla/cases/{cid}")
+        self.assertEqual(status, 200)
+        self.assertEqual(view["elapsed_business_seconds"], 0)
+        self.assertEqual(view["limit_business_seconds"], 4 * 3600)
+        self.assertFalse(view["paused"])
+
+        # 转交：计时暂停，墙上时间推进不累计
+        status, pause = authority.request(
+            "POST", f"/v1/sla/cases/{cid}/transfer", {"reason": "改派评审人"}
+        )
+        self.assertEqual(status, 201, pause)
+        self.h.clock.advance(hours=3)
+        status, view = authority.request("GET", f"/v1/sla/cases/{cid}")
+        self.assertTrue(view["paused"])
+        self.assertEqual(view["elapsed_business_seconds"], 0)
+
+        status, done = authority.request(
+            "POST", f"/v1/sla/cases/{cid}/transfer/complete",
+            {"new_owner_id": "rev-2"},
+        )
+        self.assertEqual(status, 200, done)
+        self.assertIsNotNone(done["ended_at"])
+
+        # 恢复后走满 P1 的 4 工作小时，扫描产生升级并通知新负责人
+        self.h.clock.advance(hours=5)
+        status, swept = authority.request("POST", "/v1/sla/sweep")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(swept["escalations"]), 1)
+        self.assertEqual(swept["escalations"][0]["owner_id"], "rev-2")
+
+        status, esc = authority.request("GET", f"/v1/sla/cases/{cid}/escalations")
+        self.assertEqual(len(esc["escalations"]), 1)
+
+        status, notices = reviewer2.request("GET", "/v1/notifications")
+        self.assertEqual(len(notices["notifications"]), 1)
+        self.assertIn(cid, notices["notifications"][0]["message"])
+        status, notices_old = reviewer.request("GET", "/v1/notifications")
+        self.assertEqual(notices_old["notifications"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

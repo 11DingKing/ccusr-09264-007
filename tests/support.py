@@ -15,14 +15,14 @@ START = datetime(2026, 9, 25, 1, 0, tzinfo=timezone.utc)  # 09:00 上海
 
 
 class Harness:
-    def __init__(self, moment: datetime | None = None) -> None:
+    def __init__(self, moment: datetime | None = None, calendar=None) -> None:
         fd, self.db_path = tempfile.mkstemp(prefix="qe-test-", suffix=".db")
         os.close(fd)
         os.unlink(self.db_path)  # 让仓储自行建库
         self.clock = FixedClock(moment or START)
         self.ids = SequentialIdGenerator()
         self.ctx = ApplicationContext(
-            self.db_path, clock=self.clock, ids=self.ids
+            self.db_path, clock=self.clock, ids=self.ids, calendar=calendar
         )
         self.repo = self.ctx.repo
 

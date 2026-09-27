@@ -394,6 +394,77 @@ class ApiHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # ----------------------------------------------------- 评审服务时限
+    def open_sla_case(self, request_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.sla.open_case(
+            actor,
+            request_id=request_id,
+            priority=body["priority"],
+            owner_id=body.get("owner_id"),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def get_sla_case(self, case_id: str) -> None:
+        actor = self._actor()
+        self._send_json(200, self.services.sla.recalculate(actor, case_id=case_id))
+
+    def begin_sla_transfer(self, case_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        self._send_json(
+            201,
+            self.services.sla.begin_transfer(
+                actor,
+                case_id=case_id,
+                reason=body.get("reason", ""),
+                idempotency_key=self._idempotency_key(),
+            ),
+        )
+
+    def complete_sla_transfer(self, case_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        self._send_json(
+            200,
+            self.services.sla.complete_transfer(
+                actor,
+                case_id=case_id,
+                new_owner_id=body["new_owner_id"],
+                idempotency_key=self._idempotency_key(),
+            ),
+        )
+
+    def close_sla_case(self, case_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200,
+            self.services.sla.close_case(
+                actor, case_id=case_id, idempotency_key=self._idempotency_key()
+            ),
+        )
+
+    def sweep_sla(self) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, {"escalations": self.services.sla.sweep_escalations(actor)}
+        )
+
+    def list_sla_escalations(self, case_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200,
+            {"escalations": self.services.sla.list_escalations(actor, case_id=case_id)},
+        )
+
+    def list_notifications(self) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, {"notifications": self.services.sla.list_notifications(actor)}
+        )
+
 
 # 路由表：方法 -> [(路径模式, 处理方法名)]
 def _routes() -> dict[str, list[tuple[str, str]]]:
@@ -413,6 +484,11 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
         ("/v1/requests/{request_id}/verdict", "submit_verdict"),
+        ("/v1/requests/{request_id}/sla", "open_sla_case"),
+        ("/v1/sla/cases/{case_id}/transfer", "begin_sla_transfer"),
+        ("/v1/sla/cases/{case_id}/transfer/complete", "complete_sla_transfer"),
+        ("/v1/sla/cases/{case_id}/close", "close_sla_case"),
+        ("/v1/sla/sweep", "sweep_sla"),
     ]
     get = [
         ("/v1/materials/{material_id}", "get_material"),
@@ -424,6 +500,9 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",
         ),
+        ("/v1/sla/cases/{case_id}", "get_sla_case"),
+        ("/v1/sla/cases/{case_id}/escalations", "list_sla_escalations"),
+        ("/v1/notifications", "list_notifications"),
     ]
     return {"POST": post, "GET": get}
 

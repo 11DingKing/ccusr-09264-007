@@ -128,13 +128,65 @@ class Objection:
 
 
 @dataclass
+class SlaCase:
+    """评审服务时限案件：挂在评审请求上，按优先级在案件日历上计时。"""
+
+    case_id: str
+    request_id: str
+    package_id: str
+    institution_id: str
+    priority: str               # SlaPriority
+    owner_id: str               # 当前负责人（转交后更新）
+    opened_at: str
+    closed_at: Optional[str]
+    escalated_at: Optional[str]
+
+    @property
+    def is_open(self) -> bool:
+        return self.closed_at is None
+
+
+@dataclass
+class SlaPause:
+    """转交暂停区间：[started_at, ended_at) 不计入时限；ended_at 为空表示转交中。"""
+
+    pause_id: str
+    case_id: str
+    reason: str
+    started_at: str
+    ended_at: Optional[str]
+
+
+@dataclass
+class EscalationEvent:
+    """超时升级事件：记录超时时刻的负责人与已用/限定工作秒数。"""
+
+    escalation_id: str
+    case_id: str
+    request_id: str
+    owner_id: str
+    elapsed_business_seconds: int
+    limit_business_seconds: int
+    created_at: str
+
+
+@dataclass
+class Notification:
+    """给负责人的站内通知（如时限超时升级）。"""
+
+    notification_id: str
+    user_id: str
+    kind: str                   # 如 sla_escalation
+    message: str
+    created_at: str
+
+
+@dataclass
 class Blob:
     sha256: str
     data: bytes
     media_type: str
     created_at: str
-
-
 @dataclass
 class AuditEntry:
     audit_id: str
