@@ -18,16 +18,87 @@ from ..domain.fingerprint import digest_bytes
 from ..domain.models import (
     AuditEntry,
     Blob,
+    CaseCalendar,
+    EscalationEvent,
     Material,
     MaterialVersion,
     Objection,
     PackageEntry,
     ReviewPackage,
     ReviewRequest,
+    SlaEvent,
+    SlaTimer,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+_SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS case_calendars (
+    calendar_id       TEXT PRIMARY KEY,
+    institution_id    TEXT,
+    timezone          TEXT NOT NULL,
+    work_start        TEXT NOT NULL,
+    work_end          TEXT NOT NULL,
+    weekdays_json     TEXT NOT NULL,
+    holidays_json     TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE TABLE IF NOT EXISTS sla_timers (
+    timer_id               TEXT PRIMARY KEY,
+    request_id             TEXT NOT NULL UNIQUE,
+    package_id             TEXT NOT NULL,
+    institution_id         TEXT NOT NULL,
+    priority               TEXT NOT NULL,
+    budget_seconds         INTEGER NOT NULL,
+    calendar_id            TEXT NOT NULL,
+    status                 TEXT NOT NULL,
+    current_owner_id       TEXT NOT NULL,
+    consumed_work_seconds  REAL NOT NULL DEFAULT 0,
+    segment_started_at     TEXT,
+    due_at                 TEXT,
+    escalated              INTEGER NOT NULL DEFAULT 0,
+    escalation_event_id    TEXT,
+    created_at             TEXT NOT NULL,
+    updated_at             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sla_timers_status
+    ON sla_timers(status);
+CREATE INDEX IF NOT EXISTS idx_sla_timers_package
+    ON sla_timers(package_id);
+
+CREATE TABLE IF NOT EXISTS sla_events (
+    event_id       TEXT PRIMARY KEY,
+    timer_id       TEXT NOT NULL,
+    request_id     TEXT NOT NULL,
+    package_id     TEXT NOT NULL,
+    institution_id TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    at             TEXT NOT NULL,
+    actor_id       TEXT,
+    detail_json    TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_sla_events_timer ON sla_events(timer_id, at);
+
+CREATE TABLE IF NOT EXISTS escalation_events (
+    escalation_id     TEXT PRIMARY KEY,
+    timer_id          TEXT NOT NULL,
+    request_id        TEXT NOT NULL,
+    package_id        TEXT NOT NULL,
+    institution_id    TEXT NOT NULL,
+    priority          TEXT NOT NULL,
+    owner_id          TEXT NOT NULL,
+    overdue_seconds   REAL NOT NULL,
+    occurred_at       TEXT NOT NULL,
+    notified          INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_escalations_package
+    ON escalation_events(package_id);
+CREATE INDEX IF NOT EXISTS idx_escalations_notified
+    ON escalation_events(notified);
+
+PRAGMA user_version = 2;
+"""
 
 
 class SqliteRepository(Repository):
@@ -179,6 +250,9 @@ class SqliteRepository(Repository):
                 PRAGMA user_version = 1;
             """
         )
+        # v2 迁移：评审服务时限（案件日历 / 计时器 / 时限事件 / 超时升级）。
+        # 基础脚本全部为 IF NOT EXISTS，在 v1 旧库上重放也是安全的。
+        self._conn.executescript(_SCHEMA_V2)
 
     @contextlib.contextmanager
     def _txn_direct(self) -> Iterator[None]:
@@ -626,9 +700,237 @@ class SqliteRepository(Repository):
             for r in rows
         ]
 
-    # ------------------------------------------------------------------ audit
-    def insert_audit(self, entry: AuditEntry) -> None:
+    # ------------------------------------------------------------ calendars
+    def upsert_calendar(self, calendar: CaseCalendar) -> None:
         self._conn.execute(
+            """
+            INSERT INTO case_calendars(calendar_id, institution_id, timezone,
+                work_start, work_end, weekdays_json, holidays_json)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(calendar_id) DO UPDATE SET
+                institution_id = excluded.institution_id,
+                timezone = excluded.timezone,
+                work_start = excluded.work_start,
+                work_end = excluded.work_end,
+                weekdays_json = excluded.weekdays_json,
+                holidays_json = excluded.holidays_json
+            """,
+            (
+                calendar.calendar_id,
+                calendar.institution_id,
+                calendar.timezone,
+                calendar.work_start,
+                calendar.work_end,
+                json.dumps(list(calendar.working_weekdays)),
+                json.dumps(list(calendar.holidays), ensure_ascii=False),
+            ),
+        )
+
+    def _row_to_calendar(self, row: sqlite3.Row) -> CaseCalendar:
+        return CaseCalendar(
+            calendar_id=row["calendar_id"],
+            institution_id=row["institution_id"],
+            timezone=row["timezone"],
+            work_start=row["work_start"],
+            work_end=row["work_end"],
+            working_weekdays=tuple(json.loads(row["weekdays_json"])),
+            holidays=tuple(json.loads(row["holidays_json"])),
+        )
+
+    def get_calendar(self, calendar_id: str) -> CaseCalendar | None:
+        row = self._conn.execute(
+            "SELECT * FROM case_calendars WHERE calendar_id = ?",
+            (calendar_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_calendar(row)
+
+    def list_calendars(self) -> list[CaseCalendar]:
+        rows = self._conn.execute(
+            "SELECT * FROM case_calendars ORDER BY calendar_id"
+        ).fetchall()
+        return [self._row_to_calendar(r) for r in rows]
+
+    def find_calendar_for(self, institution_id: str | None) -> CaseCalendar | None:
+        """优先机构日历，其次全局日历（institution_id IS NULL）。"""
+        if institution_id is not None:
+            row = self._conn.execute(
+                "SELECT * FROM case_calendars WHERE institution_id = ? LIMIT 1",
+                (institution_id,),
+            ).fetchone()
+            if row is not None:
+                return self._row_to_calendar(row)
+        row = self._conn.execute(
+            "SELECT * FROM case_calendars WHERE institution_id IS NULL LIMIT 1"
+        ).fetchone()
+        return None if row is None else self._row_to_calendar(row)
+
+    # ------------------------------------------------------------- SLA timers
+    def insert_sla_timer(self, timer: SlaTimer) -> None:
+        self._conn.execute(
+            "INSERT INTO sla_timers(timer_id, request_id, package_id,"
+            " institution_id, priority, budget_seconds, calendar_id, status,"
+            " current_owner_id, consumed_work_seconds, segment_started_at,"
+            " due_at, escalated, escalation_event_id, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                timer.timer_id, timer.request_id, timer.package_id,
+                timer.institution_id, timer.priority, timer.budget_seconds,
+                timer.calendar_id, timer.status, timer.current_owner_id,
+                timer.consumed_work_seconds, timer.segment_started_at,
+                timer.due_at, int(timer.escalated), timer.escalation_event_id,
+                timer.created_at, timer.updated_at,
+            ),
+        )
+
+    def _row_to_sla_timer(self, row: sqlite3.Row) -> SlaTimer:
+        return SlaTimer(
+            timer_id=row["timer_id"],
+            request_id=row["request_id"],
+            package_id=row["package_id"],
+            institution_id=row["institution_id"],
+            priority=row["priority"],
+            budget_seconds=row["budget_seconds"],
+            calendar_id=row["calendar_id"],
+            status=row["status"],
+            current_owner_id=row["current_owner_id"],
+            consumed_work_seconds=row["consumed_work_seconds"],
+            segment_started_at=row["segment_started_at"],
+            due_at=row["due_at"],
+            escalated=bool(row["escalated"]),
+            escalation_event_id=row["escalation_event_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def get_sla_timer_by_request(self, request_id: str) -> SlaTimer | None:
+        row = self._conn.execute(
+            "SELECT * FROM sla_timers WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_sla_timer(row)
+
+    def list_sla_timers_by_package(self, package_id: str) -> list[SlaTimer]:
+        rows = self._conn.execute(
+            "SELECT * FROM sla_timers WHERE package_id = ? ORDER BY created_at",
+            (package_id,),
+        ).fetchall()
+        return [self._row_to_sla_timer(r) for r in rows]
+
+    def list_running_sla_timers(self) -> list[SlaTimer]:
+        rows = self._conn.execute(
+            "SELECT * FROM sla_timers WHERE status = 'running'"
+            " ORDER BY due_at"
+        ).fetchall()
+        return [self._row_to_sla_timer(r) for r in rows]
+
+    def update_sla_timer(self, timer: SlaTimer) -> None:
+        self._conn.execute(
+            "UPDATE sla_timers SET status = ?, current_owner_id = ?,"
+            " consumed_work_seconds = ?, segment_started_at = ?, due_at = ?,"
+            " escalated = ?, escalation_event_id = ?, updated_at = ?"
+            " WHERE timer_id = ?",
+            (
+                timer.status, timer.current_owner_id,
+                timer.consumed_work_seconds, timer.segment_started_at,
+                timer.due_at, int(timer.escalated), timer.escalation_event_id,
+                timer.updated_at, timer.timer_id,
+            ),
+        )
+
+    # ------------------------------------------------------------- SLA events
+    def insert_sla_event(self, event: SlaEvent) -> None:
+        self._conn.execute(
+            "INSERT INTO sla_events(event_id, timer_id, request_id, package_id,"
+            " institution_id, kind, at, actor_id, detail_json)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                event.event_id, event.timer_id, event.request_id,
+                event.package_id, event.institution_id, event.kind, event.at,
+                event.actor_id,
+                json.dumps(event.detail, ensure_ascii=False),
+            ),
+        )
+
+    def list_sla_events(self, timer_id: str) -> list[SlaEvent]:
+        rows = self._conn.execute(
+            "SELECT * FROM sla_events WHERE timer_id = ? ORDER BY at, event_id",
+            (timer_id,),
+        ).fetchall()
+        return [
+            SlaEvent(
+                event_id=r["event_id"],
+                timer_id=r["timer_id"],
+                request_id=r["request_id"],
+                package_id=r["package_id"],
+                institution_id=r["institution_id"],
+                kind=r["kind"],
+                at=r["at"],
+                actor_id=r["actor_id"],
+                detail=json.loads(r["detail_json"]),
+            )
+            for r in rows
+        ]
+
+    # --------------------------------------------------------- escalations
+    def insert_escalation(self, escalation: EscalationEvent) -> None:
+        self._conn.execute(
+            "INSERT INTO escalation_events(escalation_id, timer_id, request_id,"
+            " package_id, institution_id, priority, owner_id, overdue_seconds,"
+            " occurred_at, notified)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                escalation.escalation_id, escalation.timer_id,
+                escalation.request_id, escalation.package_id,
+                escalation.institution_id, escalation.priority,
+                escalation.owner_id, escalation.overdue_seconds,
+                escalation.occurred_at, int(escalation.notified),
+            ),
+        )
+
+    def get_escalation_by_timer(self, timer_id: str) -> EscalationEvent | None:
+        row = self._conn.execute(
+            "SELECT * FROM escalation_events WHERE timer_id = ? LIMIT 1",
+            (timer_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_escalation(row)
+
+    def mark_escalation_notified(self, escalation_id: str) -> None:
+        self._conn.execute(
+            "UPDATE escalation_events SET notified = 1 WHERE escalation_id = ?",
+            (escalation_id,),
+        )
+
+    def list_escalations(
+        self, package_id: str | None = None
+    ) -> list[EscalationEvent]:
+        if package_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM escalation_events ORDER BY occurred_at"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM escalation_events WHERE package_id = ?"
+                " ORDER BY occurred_at",
+                (package_id,),
+            ).fetchall()
+        return [self._row_to_escalation(r) for r in rows]
+
+    @staticmethod
+    def _row_to_escalation(row: sqlite3.Row) -> EscalationEvent:
+        return EscalationEvent(
+            escalation_id=row["escalation_id"],
+            timer_id=row["timer_id"],
+            request_id=row["request_id"],
+            package_id=row["package_id"],
+            institution_id=row["institution_id"],
+            priority=row["priority"],
+            owner_id=row["owner_id"],
+            overdue_seconds=row["overdue_seconds"],
+            occurred_at=row["occurred_at"],
+            notified=bool(row["notified"]),
+        )
+
+    # ------------------------------------------------------------------ audit
+    def insert_audit(self, entry: AuditEntry) -> None:        self._conn.execute(
             "INSERT INTO audit_log(audit_id, package_id, institution_id, actor_id,"
             " action, at, detail_json) VALUES(?,?,?,?,?,?,?)",
             (

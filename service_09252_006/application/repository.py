@@ -12,12 +12,16 @@ from contextlib import AbstractContextManager
 from ..domain.models import (
     AuditEntry,
     Blob,
+    CaseCalendar,
+    EscalationEvent,
     Material,
     MaterialVersion,
     Objection,
     PackageEntry,
     ReviewPackage,
     ReviewRequest,
+    SlaEvent,
+    SlaTimer,
     User,
 )
 
@@ -139,6 +143,58 @@ class Repository(abc.ABC):
 
     @abc.abstractmethod
     def list_objections_by_package(self, package_id: str) -> list[Objection]: ...
+
+    # ---- 案件日历 ----
+    @abc.abstractmethod
+    def upsert_calendar(self, calendar: CaseCalendar) -> None: ...
+
+    @abc.abstractmethod
+    def get_calendar(self, calendar_id: str) -> CaseCalendar | None: ...
+
+    @abc.abstractmethod
+    def list_calendars(self) -> list[CaseCalendar]: ...
+
+    @abc.abstractmethod
+    def find_calendar_for(self, institution_id: str | None) -> CaseCalendar | None:
+        """优先返回机构日历，否则返回全局默认日历。"""
+
+    # ---- SLA 计时器 ----
+    @abc.abstractmethod
+    def insert_sla_timer(self, timer: SlaTimer) -> None: ...
+
+    @abc.abstractmethod
+    def get_sla_timer_by_request(self, request_id: str) -> SlaTimer | None: ...
+
+    @abc.abstractmethod
+    def list_sla_timers_by_package(self, package_id: str) -> list[SlaTimer]: ...
+
+    @abc.abstractmethod
+    def list_running_sla_timers(self) -> list[SlaTimer]: ...
+
+    @abc.abstractmethod
+    def update_sla_timer(self, timer: SlaTimer) -> None: ...
+
+    # ---- SLA 事件 ----
+    @abc.abstractmethod
+    def insert_sla_event(self, event: SlaEvent) -> None: ...
+
+    @abc.abstractmethod
+    def list_sla_events(self, timer_id: str) -> list[SlaEvent]: ...
+
+    # ---- 升级事件 ----
+    @abc.abstractmethod
+    def insert_escalation(self, escalation: EscalationEvent) -> None: ...
+
+    @abc.abstractmethod
+    def get_escalation_by_timer(self, timer_id: str) -> EscalationEvent | None: ...
+
+    @abc.abstractmethod
+    def mark_escalation_notified(self, escalation_id: str) -> None: ...
+
+    @abc.abstractmethod
+    def list_escalations(
+        self, package_id: str | None = None
+    ) -> list[EscalationEvent]: ...
 
     # ---- 审计 ----
     @abc.abstractmethod

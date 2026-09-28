@@ -46,6 +46,22 @@
 - 截止时间以“当地时间 + IANA 时区”输入，统一换算为 UTC 绝对时刻，正确
   处理跨时区与日界线。
 
+### 评审服务时限（SLA）
+案件量上升时，服务台按**案件优先级**为每次评审分配重算服务时限，按机构
+**案件日历**（时区、每日工作时段、工作日、节假日）只在工作时间计时：
+
+- 预算（工作小时）：特急 4h、加急 8h、常规 24h、普通 48h。
+- **分配即开始计时**；取消分配（等待改派）与评审人拒绝即**暂停计时**，
+  暂停/转交窗口**不继续累加**；改派给新负责人时，新计时器**继承此前已用
+  工作秒数**并按剩余预算重新排定到期时刻（`due_at`）；评审人提交结论后
+  关闭计时。
+- 扫描运行中的计时器（`sla-scan` / `POST /v1/sla/scan`，可由 cron 周期
+  调用），超时在同一事务内写 `escalation_events` 与 SLA 事件，并通知
+  **当前负责人**（经可替换 `Notifier` 端口，默认进程内收集；发送失败
+  保留 `notified=false` 由下次扫描补发）；重复扫描幂等，不重复升级。
+- 暂停、关闭与升级事件全部追加写入 SQLite（不可变事件流）。
+
+
 ## 分层结构
 
 ```
@@ -81,6 +97,16 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 
 退出码：`0` 通过，`2` 发现不一致/篡改，`1` 数据库无法打开。
 
+## 服务时限扫描
+
+可由 cron/定时任务周期调用（也提供 `POST /v1/sla/scan` 在线端点）：
+
+```bash
+python3 -m service_09252_006.cli sla-scan --db ./data/qe.db [--json]
+```
+
+超时的计时器会生成升级事件并通知当前负责人；无超时输出“没有新的超时升级”。
+
 ## HTTP API 摘要
 
 认证：`Authorization: Bearer <token>`；建用户/发 token 的引导端点用
@@ -99,13 +125,19 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/packages/{id}/seal` | 封存（固定清单指纹） |
 | GET  | `/v1/packages/{id}` | 包视图（敏感条目按权限遮蔽） |
 | GET  | `/v1/packages/{id}/entries/{vid}/content` | 授权下载内容字节 |
-| POST | `/v1/packages/{id}/assignments` | 分配评审（可带跨时区截止） |
+| POST | `/v1/packages/{id}/assignments` | 分配评审（可带跨时区截止、`priority`） |
 | GET  | `/v1/packages/{id}/requests` | 分配情况 |
 | POST | `/v1/requests/{id}/respond` | 评审人接受/拒绝 |
 | POST | `/v1/requests/{id}/objections` | 登记异议 |
 | POST | `/v1/requests/{id}/verdict` | 提交 approve/object（object 须先有异议） |
-| POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权） |
+| POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权；SLA 暂停） |
 | POST | `/v1/packages/{id}/decision` | 签发 approved/needs_revision/rejected |
+| POST | `/v1/calendars` | 配置案件日历（时区/工作时段/工作日/节假日） |
+| GET  | `/v1/packages/{id}/sla` | 包内各评审请求的服务时限计时器 |
+| GET  | `/v1/requests/{id}/sla` | 单个计时器（已用/剩余工作时间、到期时刻） |
+| GET  | `/v1/requests/{id}/sla/events` | 暂停/关闭/升级事件流 |
+| POST | `/v1/sla/scan` | 扫描超时，生成升级并通知当前负责人 |
+| GET  | `/v1/escalations` | 升级事件列表（可按包过滤） |
 
 评审状态机：`draft → sealed → under_review → decided`；复审包重新走一遍，
 旧包不复活。
@@ -120,7 +152,9 @@ python3 -m compileall -q service_09252_006 tests
 覆盖：内容寻址与版本链、封存不变量、**材料撤回**（封存前后）、后补材料
 只能复审、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
-多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
+多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及
+**评审服务时限**（按优先级/案件日历计工作时间、转交期间不累加、
+跨周末节假日、超时升级与通知当前负责人、通知失败补发）和完整 HTTP
 端到端流程。
 
 扩展模块覆盖证据、审批、权限、留存、对账与恢复等业务边界。

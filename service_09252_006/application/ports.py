@@ -67,3 +67,53 @@ class SequentialIdGenerator(IdGenerator):
     def new_id(self, prefix: str) -> str:
         self._counts[prefix] = self._counts.get(prefix, 0) + 1
         return f"{prefix}_{self._counts[prefix]}"
+
+
+class Notifier(abc.ABC):
+    """通知外发端口：超时升级后通知当前负责人。
+
+    返回 True 表示已送达；False/抛错表示暂未送达，调用方会保留
+    notified=False 并在下次扫描时重试，从而升级事件与“是否已通知”可分别追踪。
+    """
+
+    @abc.abstractmethod
+    def notify_escalation(
+        self,
+        *,
+        owner_id: str,
+        package_id: str,
+        request_id: str,
+        priority: str,
+        overdue_seconds: float,
+        occurred_at: str,
+    ) -> bool:
+        """向当前负责人发送升级通知。"""
+
+
+class CollectingNotifier(Notifier):
+    """默认/测试用：把通知收集在进程内列表，不做真实外发。"""
+
+    def __init__(self) -> None:
+        self.messages: list[dict] = []
+
+    def notify_escalation(
+        self,
+        *,
+        owner_id: str,
+        package_id: str,
+        request_id: str,
+        priority: str,
+        overdue_seconds: float,
+        occurred_at: str,
+    ) -> bool:
+        self.messages.append(
+            {
+                "owner_id": owner_id,
+                "package_id": package_id,
+                "request_id": request_id,
+                "priority": priority,
+                "overdue_seconds": overdue_seconds,
+                "occurred_at": occurred_at,
+            }
+        )
+        return True

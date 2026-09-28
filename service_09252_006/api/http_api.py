@@ -316,6 +316,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             reviewer_id=body["reviewer_id"],
             deadline_local_iso=body.get("deadline_local_iso"),
             deadline_timezone=body.get("deadline_timezone"),
+            priority=body.get("priority", "normal"),
             idempotency_key=self._idempotency_key(),
         )
         self._send_json(201, result)
@@ -394,6 +395,80 @@ class ApiHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # ----------------------------------------------------------- 服务时限
+    def configure_calendar(self) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.sla.configure_calendar(
+            actor,
+            calendar_id=body["calendar_id"],
+            timezone=body.get("timezone", "Asia/Shanghai"),
+            work_start=body.get("work_start", "09:00"),
+            work_end=body.get("work_end", "17:00"),
+            working_weekdays=body.get("working_weekdays", (1, 2, 3, 4, 5)),
+            holidays=body.get("holidays", ()),
+            institution_id=body.get("institution_id"),
+        )
+        self._send_json(201, result)
+
+    def list_package_sla(self, package_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200,
+            {"timers": self.services.sla.list_timers_for_package(actor, package_id)},
+        )
+
+    def get_request_sla(self, request_id: str) -> None:
+        actor = self._actor()
+        self._send_json(200, self.services.sla.get_timer(actor, request_id))
+
+    def get_request_sla_events(self, request_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, {"events": self.services.sla.list_events(actor, request_id)}
+        )
+
+    def scan_sla(self) -> None:
+        actor = self._actor()
+        if not actor.has_role(Role.QUALITY_AUTHORITY):
+            from ..domain.errors import PermissionDeniedError
+
+            raise PermissionDeniedError("只有质量主管可触发服务时限扫描")
+        self._send_json(200, {"escalations": self.services.sla.scan_due()})
+
+    def list_escalations(self) -> None:
+        actor = self._actor()
+        if not (
+            actor.has_role(Role.QUALITY_AUTHORITY) or actor.has_role(Role.AUDITOR)
+        ):
+            from ..domain.errors import PermissionDeniedError
+
+            raise PermissionDeniedError("只有质量主管/审计可查看升级事件")
+        from urllib.parse import parse_qs
+
+        query = parse_qs(urlparse(self.path).query)
+        package_id = query.get("package_id", [None])[0]
+        rows = self.services.repo.list_escalations(package_id)
+        self._send_json(
+            200,
+            {
+                "escalations": [
+                    {
+                        "escalation_id": e.escalation_id,
+                        "timer_id": e.timer_id,
+                        "request_id": e.request_id,
+                        "package_id": e.package_id,
+                        "priority": e.priority,
+                        "owner_id": e.owner_id,
+                        "overdue_seconds": round(e.overdue_seconds, 3),
+                        "occurred_at": e.occurred_at,
+                        "notified": e.notified,
+                    }
+                    for e in rows
+                ]
+            },
+        )
+
 
 # 路由表：方法 -> [(路径模式, 处理方法名)]
 def _routes() -> dict[str, list[tuple[str, str]]]:
@@ -413,6 +488,8 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
         ("/v1/requests/{request_id}/verdict", "submit_verdict"),
+        ("/v1/calendars", "configure_calendar"),
+        ("/v1/sla/scan", "scan_sla"),
     ]
     get = [
         ("/v1/materials/{material_id}", "get_material"),
@@ -420,6 +497,10 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/packages", "list_packages"),
         ("/v1/packages/{package_id}", "get_package"),
         ("/v1/packages/{package_id}/requests", "list_requests"),
+        ("/v1/packages/{package_id}/sla", "list_package_sla"),
+        ("/v1/requests/{request_id}/sla", "get_request_sla"),
+        ("/v1/requests/{request_id}/sla/events", "get_request_sla_events"),
+        ("/v1/escalations", "list_escalations"),
         (
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",

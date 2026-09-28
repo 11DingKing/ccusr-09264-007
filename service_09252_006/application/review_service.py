@@ -10,7 +10,10 @@
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ..domain.enums import (
+    CasePriority,
     Decision,
     PackageStatus,
     RequestStatus,
@@ -29,8 +32,16 @@ from ..domain.models import Objection, ReviewRequest, User
 from ..application.timeutil import now_is_past, resolve_deadline
 from .base import Service, require_roles
 
+if TYPE_CHECKING:
+    from .sla_service import SlaService
+
 
 class ReviewService(Service):
+    def __init__(self, repo, clock, ids) -> None:
+        super().__init__(repo, clock, ids)
+        # 由容器装配：评审服务时限（开始/暂停/关闭随评审状态机联动）
+        self.sla: SlaService | None = None
+
     # ------------------------------------------------------------- 分配
     def assign_reviewer(
         self,
@@ -40,9 +51,12 @@ class ReviewService(Service):
         reviewer_id: str,
         deadline_local_iso: str | None = None,
         deadline_timezone: str | None = None,
+        priority: str = CasePriority.NORMAL.value,
         idempotency_key: str | None = None,
     ) -> dict:
         require_roles(actor, Role.QUALITY_AUTHORITY, Role.INSTITUTION_ADMIN)
+        if priority not in {p.value for p in CasePriority}:
+            raise ValidationError("未知案件优先级", details={"priority": priority})
 
         def work() -> dict:
             package = self.repo.get_package(package_id)
@@ -114,6 +128,8 @@ class ReviewService(Service):
                     if fresh.status != PackageStatus.UNDER_REVIEW.value:
                         raise ConflictError("评审包状态已改变，分配失败")
             self.repo.insert_request(request)
+            if self.sla is not None:
+                self.sla.start_for_request(request, priority)
             self.audit(
                 actor.user_id, "review.assigned",
                 package_id=package_id, institution_id=package.institution_id,
@@ -153,6 +169,9 @@ class ReviewService(Service):
             req.status = RequestStatus.CANCELLED.value
             req.responded_at = self.clock.now_iso()
             self.repo.update_request(req)
+            if self.sla is not None:
+                # 等待改派（转交期间）暂停计时，时间不再累加
+                self.sla.pause_for_request(request_id, reason=reason or "cancelled")
             self.audit(
                 actor.user_id, "review.cancelled",
                 package_id=req.package_id, institution_id=req.institution_id,
@@ -187,6 +206,9 @@ class ReviewService(Service):
             )
             req.responded_at = self.clock.now_iso()
             self.repo.update_request(req)
+            if not accept and self.sla is not None:
+                # 评审人拒绝：等待改派，按转交期间暂停，已用时间保留结转
+                self.sla.pause_for_request(request_id, reason="declined")
             self.audit(
                 actor.user_id,
                 "review.accepted" if accept else "review.declined",
@@ -278,6 +300,8 @@ class ReviewService(Service):
             req.comment = comment.strip() or None
             req.completed_at = self.clock.now_iso()
             self.repo.update_request(req)
+            if self.sla is not None:
+                self.sla.close_for_request(request_id, reason="completed")
             self.audit(
                 actor.user_id, "review.verdict_submitted",
                 package_id=req.package_id, institution_id=req.institution_id,

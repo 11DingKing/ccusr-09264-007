@@ -10,12 +10,15 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .enums import (
+    CasePriority,
     Decision,
     MaterialKind,
     PackageStatus,
     RequestStatus,
     Role,
     Sensitivity,
+    SlaEventKind,
+    SlaTimerStatus,
     Verdict,
 )
 
@@ -144,6 +147,83 @@ class AuditEntry:
     action: str
     at: str
     detail: dict = field(default_factory=dict)
+
+
+@dataclass
+class CaseCalendar:
+    """案件日历：按机构工作时段与节假日计时（非 7×24）。
+
+    work_start/work_end 为当地“时:分”；working_weekdays 为 ISO 星期
+    （1=周一…7=周日）；holidays 为机构当地日期集合（YYYY-MM-DD）；
+    timezone 给出这些墙上时间所属的 IANA 时区。
+    """
+
+    calendar_id: str
+    institution_id: Optional[str]          # None 表示全局默认日历
+    timezone: str
+    work_start: str = "09:00"
+    work_end: str = "17:00"
+    working_weekdays: tuple[int, ...] = (1, 2, 3, 4, 5)
+    holidays: tuple[str, ...] = ()
+
+
+@dataclass
+class SlaTimer:
+    """单个评审请求的服务时限计时器。
+
+    已用工作时间 = consumed_work_seconds（此前每段累计）
+                 + 自 segment_started_at 起、按案件日历流逝的工作秒数。
+    暂停时把当前段结算进 consumed_work_seconds 并清空 segment_started_at；
+    转交暂停期间 segment 不存在，时间不会继续累加。
+    """
+
+    timer_id: str
+    request_id: str
+    package_id: str
+    institution_id: str
+    priority: str                          # CasePriority
+    budget_seconds: int                    # 该优先级的时限预算（工作秒）
+    calendar_id: str
+    status: str                            # SlaTimerStatus
+    current_owner_id: str                  # 当前负责人（评审人）
+    consumed_work_seconds: float = 0.0
+    segment_started_at: Optional[str] = None  # 当前连续计时段起点（UTC）；暂停为 None
+    due_at: Optional[str] = None           # 最近一次起步时按剩余预算排定的到期时刻
+    escalated: bool = False
+    escalation_event_id: Optional[str] = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class SlaEvent:
+    """时限暂停/恢复/关闭与升级等事件，追加写入、不可变。"""
+
+    event_id: str
+    timer_id: str
+    request_id: str
+    package_id: str
+    institution_id: str
+    kind: str                              # SlaEventKind
+    at: str
+    actor_id: Optional[str] = None
+    detail: dict = field(default_factory=dict)
+
+
+@dataclass
+class EscalationEvent:
+    """超时升级事件：超时后生成并通知当前负责人。"""
+
+    escalation_id: str
+    timer_id: str
+    request_id: str
+    package_id: str
+    institution_id: str
+    priority: str
+    owner_id: str                          # 升级发生时的当前负责人
+    overdue_seconds: float                 # 超时的工作秒数
+    occurred_at: str
+    notified: bool = False
 
 
 def asdict(obj) -> dict:

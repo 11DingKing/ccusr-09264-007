@@ -49,3 +49,25 @@ class Decision(str, Enum):
     APPROVED = "approved"
     NEEDS_REVISION = "needs_revision"
     REJECTED = "rejected"
+
+
+class CasePriority(str, Enum):
+    """案件优先级：决定评审服务时限预算（按工作时间计）。"""
+
+    URGENT = "urgent"  # 特急
+    HIGH = "high"      # 加急
+    NORMAL = "normal"  # 常规
+    LOW = "low"        # 普通
+
+
+class SlaTimerStatus(str, Enum):
+    RUNNING = "running"  # 计时中
+    PAUSED = "paused"    # 暂停中（如已取消、等待转交，不累计时长）
+    CLOSED = "closed"    # 评审完成/拒绝/已转出，不再计时
+
+
+class SlaEventKind(str, Enum):
+    TIMER_STARTED = "timer_started"      # 时限开始计时（转交后接手为新计时器，携带结转秒数）
+    TIMER_PAUSED = "timer_paused"        # 转交期间暂停
+    TIMER_CLOSED = "timer_closed"        # 评审终结/已转出，计时关闭
+    ESCALATED = "escalated"              # 超时升级

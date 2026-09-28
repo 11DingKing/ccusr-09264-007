@@ -4,9 +4,12 @@
   python3 -m service_09252_006.cli serve   --db ./data/qe.db --host 127.0.0.1 --port 8080 \\
       --bootstrap-token <token>
   python3 -m service_09252_006.cli verify  --db ./data/qe.db [--json]
+  python3 -m service_09252_006.cli sla-scan --db ./data/qe.db [--json]
 
 verify 为离线核验：不需要服务进程，只读打开数据库并重算全部指纹。
 核验通过退出码 0；发现不一致退出码 2；数据库无法打开退出码 1。
+sla-scan 扫描运行中的评审服务时限计时器，超时则生成升级事件并通知当前负责人，
+可由 cron 等定时调用；有新升级退出码 0（输出数量）。
 """
 from __future__ import annotations
 
@@ -34,12 +37,18 @@ def main(argv: list[str] | None = None) -> int:
     verify_p.add_argument("--db", required=True)
     verify_p.add_argument("--json", action="store_true", help="只输出 JSON 报告")
 
+    sla_p = sub.add_parser("sla-scan", help="扫描评审服务时限，超时生成升级并通知")
+    sla_p.add_argument("--db", required=True)
+    sla_p.add_argument("--json", action="store_true", help="只输出 JSON")
+
     args = parser.parse_args(argv)
 
     if args.command == "serve":
         return _serve(args)
     if args.command == "verify":
         return _verify(args)
+    if args.command == "sla-scan":
+        return _sla_scan(args)
     return 1
 
 
@@ -74,6 +83,33 @@ def _verify(args: argparse.Namespace) -> int:
     else:
         _print_human(report)
     return 0 if report.ok else 2
+
+
+def _sla_scan(args: argparse.Namespace) -> int:
+    try:
+        context = ApplicationContext(args.db)
+    except (sqlite3.Error, OSError) as exc:
+        print(f"无法打开数据库: {exc}", file=sys.stderr)
+        return 1
+    try:
+        escalations = context.sla.scan_due()
+    finally:
+        context.close()
+    if args.json:
+        print(json.dumps({"escalations": escalations}, ensure_ascii=False,
+                         indent=2, sort_keys=True))
+    else:
+        if escalations:
+            print(f"新增 {len(escalations)} 条超时升级：")
+            for e in escalations:
+                print(
+                    f"  [{e['priority']}] 包 {e['package_id']} 请求 {e['request_id']}"
+                    f" 当前负责人 {e['owner_id']} 超 {e['overdue_seconds']:.0f} 工作秒"
+                    f" 已通知={e['notified']}"
+                )
+        else:
+            print("没有新的超时升级")
+    return 0
 
 
 def _print_human(report) -> None:
